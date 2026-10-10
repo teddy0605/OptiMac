@@ -12,7 +12,28 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Nothing special here; StatusBarController will be set up by the App.
+        runSelfTestIfRequested()
     }
+
+    #if DEBUG
+    // Diagnostics: run the task runner in the real app context and log the
+    // results, so sandbox/TCC failures can be told apart from task bugs.
+    private func runSelfTestIfRequested() {
+        guard CommandLine.arguments.contains("--optimac-selftest") else { return }
+        let commands = [
+            "defaults write com.apple.dock OptimacProbe -int 0 && defaults delete com.apple.dock OptimacProbe && echo dock-ok",
+            "defaults write NSGlobalDomain OptimacProbe -bool true && defaults delete NSGlobalDomain OptimacProbe && echo nsglobal-ok",
+            "rm -rf ~/Library/Caches/* 2>/dev/null; ls ~/Library/Caches && echo caches-ok",
+        ]
+        var lines: [String] = []
+        for command in commands {
+            let outcome = ShellRunner.run(command)
+            lines.append("$ \(command)\nexit=\(outcome.code)\n\(outcome.output)\n")
+        }
+        try? lines.joined(separator: "\n")
+            .write(toFile: "/tmp/optimac-selftest.log", atomically: true, encoding: .utf8)
+    }
+    #endif
 
     func openMainAppWindow() {
         // Activate the app and bring the main window to front

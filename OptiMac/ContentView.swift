@@ -154,12 +154,28 @@ class RealSystemMonitor: ObservableObject {
             let processes = getRealProcessList()
             let topMemoryProcesses = Array(processes.sorted { $0.memoryUsage > $1.memoryUsage }.prefix(6))
             
+            // Real swap usage from sysctl vm.swapusage
+            // (format: "total = 2048.00M  used = 512.00M  free = 1536.00M")
+            var swapUsedGB = 0.0
+            var swapSize = 0
+            if sysctlbyname("vm.swapusage", nil, &swapSize, nil, 0) == 0, swapSize > 0 {
+                var swapBuffer = [CChar](repeating: 0, count: swapSize)
+                if sysctlbyname("vm.swapusage", &swapBuffer, &swapSize, nil, 0) == 0 {
+                    let swapInfo = String(cString: swapBuffer)
+                    if let usedRange = swapInfo.range(of: "used = "),
+                       let megaRange = swapInfo.range(of: "M", range: usedRange.upperBound..<swapInfo.endIndex),
+                       let swapMB = Double(swapInfo[usedRange.upperBound..<megaRange.lowerBound]) {
+                        swapUsedGB = swapMB / 1024
+                    }
+                }
+            }
+
             memoryInfo = RealMemoryInfo(
                 totalMemory: totalGB,
                 usedMemory: usedGB,
                 freeMemory: freeGB,
                 appMemoryUsage: topMemoryProcesses,
-                swapUsed: 0 // Could be added via sysctl vm.swapusage if desired
+                swapUsed: swapUsedGB
             )
         }
     }
@@ -616,7 +632,16 @@ struct OptimizationTask: Identifiable {
     let description: String
     let category: String
     let command: String
+    var requiresAdmin: Bool = false
     var isSelected: Bool = false
+}
+
+// Result of one optimization task run, shown in the confirmation sheet.
+struct TaskRunResult: Identifiable {
+    let id = UUID()
+    let task: OptimizationTask
+    let succeeded: Bool
+    let output: String
 }
 
 // MARK: - System Monitor (keeping optimization functionality)
@@ -629,7 +654,7 @@ class SystemMonitor: ObservableObject {
     
     // Confirmation sheet
     @Published var showConfirmation = false
-    @Published var lastRunTasks: [OptimizationTask] = []
+    @Published var taskResults: [TaskRunResult] = []
     @Published var lastRunDate: Date?
     
     init() {
@@ -689,55 +714,82 @@ class SystemMonitor: ObservableObject {
     private func initializeOptimizationTasks() {
         optimizationTasks = [
             // Memory & Performance
-            OptimizationTask(id: "purge_memory", title: "Purge inactive memory", description: "Free up inactive memory using purge command", category: "Memory & Performance", command: "sudo purge"),
-            OptimizationTask(id: "clear_caches", title: "Clear system caches", description: "Clear user and system caches to free up space", category: "Memory & Performance", command: "sudo rm -rf ~/Library/Caches/* /Library/Caches/*"),
-            OptimizationTask(id: "optimize_swap", title: "Optimize swap usage", description: "Configure swap settings for better performance", category: "Memory & Performance", command: "sudo purge"),
-            OptimizationTask(id: "disable_spotlight", title: "Disable Spotlight indexing", description: "Turn off Spotlight indexing for better performance", category: "Memory & Performance", command: "sudo mdutil -i off /"),
-            OptimizationTask(id: "reindex_spotlight", title: "Re-index Spotlight", description: "Rebuild Spotlight index for better search performance", category: "Memory & Performance", command: "sudo mdutil -E /"),
-            OptimizationTask(id: "reduce_animations", title: "Reduce motion & animations", description: "Disable system animations for snappier performance", category: "Memory & Performance", command: "defaults write com.apple.universalaccess reduceMotion -bool true"),
+            OptimizationTask(id: "purge_memory", title: "Purge inactive memory", description: "Free up inactive memory using purge command", category: "Memory & Performance", command: "sudo purge", requiresAdmin: true),
+            OptimizationTask(id: "clear_caches", title: "Clear user caches", description: "Clear user cache files to free up disk space", category: "Memory & Performance", command: "rm -rf ~/Library/Caches/* 2>/dev/null; ls ~/Library/Caches"),
+            OptimizationTask(id: "disable_spotlight", title: "Disable Spotlight indexing", description: "Turn off Spotlight indexing for better performance", category: "Memory & Performance", command: "sudo mdutil -i off /", requiresAdmin: true),
+            OptimizationTask(id: "reindex_spotlight", title: "Re-index Spotlight", description: "Rebuild Spotlight index for better search performance", category: "Memory & Performance", command: "sudo mdutil -E /", requiresAdmin: true),
+            // Apple SIP-protects com.apple.universalaccess; third-party apps
+            // cannot write it (cfprefsd rejects, PlistBuddy gets EPERM), so
+            // this task opens the Motion pane for a one-click toggle instead.
+            OptimizationTask(id: "reduce_animations", title: "Reduce motion setting", description: "Open the Reduce Motion setting in System Settings for a quick toggle", category: "Memory & Performance", command: "open 'x-apple.systempreferences:com.apple.Accessibility-Settings.extension?Motion'"),
             
             // System Tweaks
-            OptimizationTask(id: "disable_dock_animation", title: "Disable Dock animations", description: "Remove Dock animations for faster response", category: "System Tweaks", command: "defaults write com.apple.dock autohide-time-modifier -int 0"),
+            OptimizationTask(id: "disable_dock_animation", title: "Disable Dock animations", description: "Remove Dock animations for faster response", category: "System Tweaks", command: "defaults write com.apple.dock autohide-time-modifier -int 0 && defaults write com.apple.dock launchanim -bool false && killall Dock"),
             OptimizationTask(id: "disable_window_animations", title: "Disable window animations", description: "Remove window animations for snappier feel", category: "System Tweaks", command: "defaults write NSGlobalDomain NSAutomaticWindowAnimationsEnabled -bool false"),
-            OptimizationTask(id: "optimize_launchpad", title: "Optimize Launchpad", description: "Speed up Launchpad loading and animations", category: "System Tweaks", command: "defaults write com.apple.dock springboard-show-duration -int 0"),
-            OptimizationTask(id: "disable_dashboard", title: "Disable Dashboard", description: "Turn off Dashboard to save memory", category: "System Tweaks", command: "defaults write com.apple.dashboard mcx-disabled -bool true"),
-            OptimizationTask(id: "optimize_finder", title: "Optimize Finder", description: "Configure Finder for better performance", category: "System Tweaks", command: "defaults write com.apple.finder AppleShowAllFiles YES"),
-            OptimizationTask(id: "disable_sudden_motion", title: "Disable Sudden Motion Sensor", description: "Turn off SMS for SSDs (M-Series Macs)", category: "System Tweaks", command: "sudo pmset -a sms 0"),
+            OptimizationTask(id: "optimize_launchpad", title: "Optimize Launchpad", description: "Speed up Launchpad loading and animations", category: "System Tweaks", command: "defaults write com.apple.dock springboard-show-duration -int 0 && killall Dock"),
+            OptimizationTask(id: "optimize_finder", title: "Show hidden files in Finder", description: "Reveal hidden files in Finder for easier debugging", category: "System Tweaks", command: "defaults write com.apple.finder AppleShowAllFiles -bool true && killall Finder"),
             
             // Network
-            OptimizationTask(id: "flush_dns", title: "Flush DNS cache", description: "Clear DNS cache for faster lookups", category: "Network", command: "sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder"),
-            OptimizationTask(id: "optimize_network", title: "Optimize network settings", description: "Configure network for better performance", category: "Network", command: "sudo sysctl -w net.inet.tcp.delayed_ack=0"),
-            OptimizationTask(id: "disable_ipv6", title: "Disable IPv6", description: "Turn off IPv6 if not needed", category: "Network", command: "networksetup -setv6off Wi-Fi"),
-            OptimizationTask(id: "optimize_wifi", title: "Optimize Wi-Fi", description: "Configure Wi-Fi settings for better performance", category: "Network", command: "sudo /System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport prefs DisconnectOnLogout=NO"),
+            OptimizationTask(id: "flush_dns", title: "Flush DNS cache", description: "Clear DNS cache for faster lookups", category: "Network", command: "sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder", requiresAdmin: true),
             
             // Development
             OptimizationTask(id: "optimize_git", title: "Optimize Git performance", description: "Configure Git for better performance", category: "Development", command: "git config --global core.precomposeunicode true"),
             OptimizationTask(id: "optimize_homebrew", title: "Optimize Homebrew", description: "Clean and optimize Homebrew installation", category: "Development", command: "brew cleanup"),
             OptimizationTask(id: "optimize_node", title: "Optimize Node.js", description: "Clean Node.js and npm cache", category: "Development", command: "npm cache clean --force"),
-            OptimizationTask(id: "optimize_python", title: "Optimize Python", description: "Clean Python cache and optimize", category: "Development", command: "python -m pip cache purge"),
+            OptimizationTask(id: "optimize_python", title: "Optimize Python", description: "Clean Python pip cache", category: "Development", command: "python3 -m pip cache purge"),
             OptimizationTask(id: "optimize_docker", title: "Optimize Docker", description: "Clean Docker containers and images", category: "Development", command: "docker system prune -f"),
             OptimizationTask(id: "optimize_xcode", title: "Optimize Xcode", description: "Clean Xcode derived data and cache", category: "Development", command: "rm -rf ~/Library/Developer/Xcode/DerivedData/*"),
             
             // Advanced
-            OptimizationTask(id: "rebuild_spotlight", title: "Rebuild Spotlight index", description: "Completely rebuild Spotlight search index", category: "Advanced", command: "sudo mdutil -i off / && sudo mdutil -i on /"),
-            OptimizationTask(id: "reset_launchservices", title: "Reset Launch Services", description: "Fix 'Open With' menu problems", category: "Advanced", command: "sudo /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -kill -r -domain local"),
-            OptimizationTask(id: "clear_font_cache", title: "Clear font cache", description: "Clear system font cache", category: "Advanced", command: "sudo atsutil databases -remove"),
-            OptimizationTask(id: "optimize_ssd", title: "Optimize SSD settings", description: "Configure SSD-specific optimizations", category: "Advanced", command: "sudo trimforce enable"),
-            OptimizationTask(id: "disable_crash_reporter", title: "Disable crash reporter", description: "Turn off automatic crash reporting", category: "Advanced", command: "defaults write com.apple.CrashReporter DialogType none"),
-            OptimizationTask(id: "optimize_metal", title: "Optimize Metal performance", description: "Configure Metal graphics performance", category: "Advanced", command: "defaults write com.apple.CoreGraphics CGDirectDisplayID -bool true")
+            OptimizationTask(id: "rebuild_spotlight", title: "Rebuild Spotlight index", description: "Completely rebuild Spotlight search index", category: "Advanced", command: "sudo mdutil -i off / && sudo mdutil -i on /", requiresAdmin: true),
+            OptimizationTask(id: "reset_launchservices", title: "Reset Launch Services", description: "Fix 'Open With' menu problems", category: "Advanced", command: "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -kill -r -domain local -domain user"),
+            OptimizationTask(id: "clear_font_cache", title: "Clear font cache", description: "Clear system font cache", category: "Advanced", command: "sudo atsutil databases -remove", requiresAdmin: true),
+            OptimizationTask(id: "optimize_ssd", title: "Enable SSD TRIM", description: "Force-enable TRIM for third-party SSDs", category: "Advanced", command: "sudo trimforce enable", requiresAdmin: true),
+            OptimizationTask(id: "disable_crash_reporter", title: "Disable crash reporter", description: "Turn off automatic crash reporting dialogs", category: "Advanced", command: "defaults write com.apple.CrashReporter DialogType none")
         ]
     }
     
     func runOptimization() {
-        guard !selectedTasks.isEmpty else { return }
-        
+        guard !selectedTasks.isEmpty, !isOptimizing else { return }
+
+        let tasks = optimizationTasks.filter { selectedTasks.contains($0.id) }
         isOptimizing = true
-        lastRunTasks = optimizationTasks.filter { selectedTasks.contains($0.id) }
+        taskResults = []
         lastRunDate = Date()
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-            self.isOptimizing = false
-            self.showConfirmation = true
+
+        // Split on the main actor; the background work only touches strings.
+        let userCommands: [(id: String, command: String)] = tasks
+            .filter { !$0.requiresAdmin }
+            .map { (id: $0.id, command: $0.command) }
+        let adminCommands: [(id: String, command: String)] = tasks
+            .filter { $0.requiresAdmin }
+            .map { (id: $0.id, command: $0.command) }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var outcomes: [(id: String, code: Int32, output: String)] = []
+
+            // User-level tasks run one by one in a login shell.
+            for entry in userCommands {
+                let outcome = ShellRunner.run(entry.command)
+                outcomes.append((entry.id, outcome.code, outcome.output))
+            }
+
+            // Admin tasks are batched into one root shell, so several admin
+            // tasks in one run trigger a single password prompt.
+            if !adminCommands.isEmpty {
+                let outcome = ShellRunner.runAsRoot(adminCommands.map { $0.command })
+                outcomes.append(contentsOf: adminCommands.map { (id: $0.id, code: outcome.code, output: outcome.output) })
+            }
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.taskResults = outcomes.compactMap { outcome in
+                    guard let task = tasks.first(where: { $0.id == outcome.id }) else { return nil }
+                    return TaskRunResult(task: task, succeeded: outcome.code == 0, output: outcome.output)
+                }
+                self.isOptimizing = false
+                self.showConfirmation = true
+            }
         }
     }
     
@@ -755,6 +807,58 @@ class SystemMonitor: ObservableObject {
     
     var categories: [String] {
         return Array(Set(optimizationTasks.map { $0.category })).sorted()
+    }
+}
+
+// MARK: - Shell Runner
+enum ShellRunner {
+    // Runs a command in a login shell so Homebrew and version-manager tools
+    // are on PATH. Output goes to a temp file so large output cannot
+    // deadlock the pipe.
+    nonisolated static func run(_ command: String) -> (code: Int32, output: String) {
+        execute("/bin/zsh", arguments: ["-lc", command])
+    }
+
+    // Runs all commands as root in one batch through osascript, so a run with
+    // several admin tasks triggers a single password prompt.
+    nonisolated static func runAsRoot(_ commands: [String]) -> (code: Int32, output: String) {
+        let escaped = commands.joined(separator: " ; ")
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let script = "do shell script \"\(escaped)\" with administrator privileges"
+        return execute("/usr/bin/osascript", arguments: ["-e", script])
+    }
+
+    private nonisolated static func execute(_ launchPath: String, arguments: [String]) -> (code: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: launchPath)
+        process.arguments = arguments
+
+        let logURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("OptiMac-\(UUID().uuidString).log")
+        guard FileManager.default.createFile(atPath: logURL.path, contents: nil),
+              let logHandle = try? FileHandle(forWritingTo: logURL) else {
+            return (-1, "Could not create output log")
+        }
+        process.standardOutput = logHandle
+        process.standardError = logHandle
+
+        do {
+            try process.run()
+        } catch {
+            try? logHandle.close()
+            try? FileManager.default.removeItem(at: logURL)
+            return (-1, "Could not start \(launchPath): \(error.localizedDescription)")
+        }
+
+        process.waitUntilExit()
+        try? logHandle.close()
+
+        let data = FileManager.default.contents(atPath: logURL.path) ?? Data()
+        try? FileManager.default.removeItem(at: logURL)
+        let output = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return (process.terminationStatus, output)
     }
 }
 
@@ -1206,6 +1310,8 @@ struct OptimizationTaskRow: View {
     let isSelected: Bool
     let onToggle: () -> Void
     
+    @State private var showCommand = false
+    
     var body: some View {
         Button(action: onToggle) {
             HStack(spacing: 16) {
@@ -1240,6 +1346,37 @@ struct OptimizationTaskRow: View {
                 }
                 
                 Spacer()
+                
+                Button {
+                    showCommand.toggle()
+                } label: {
+                    Image(systemName: "info.circle")
+                        .font(.system(.subheadline, weight: .semibold))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .popover(isPresented: $showCommand) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(task.title)
+                            .font(.headline)
+                        Text(task.description)
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                        Divider()
+                        Label(
+                            task.requiresAdmin ? "Runs as administrator (one password prompt per run)" : "Runs as the current user",
+                            systemImage: task.requiresAdmin ? "lock.shield" : "person.crop.circle"
+                        )
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        Text(task.command)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(16)
+                    .frame(minWidth: 340, alignment: .leading)
+                }
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 16)
@@ -1253,77 +1390,10 @@ struct OptimizationTaskRow: View {
         .buttonStyle(.plain)
     }
 }
-
-// MARK: - Enhanced Optimization Category View
-struct OptimizationCategoryView: View {
-    let category: String
-    @ObservedObject var systemMonitor: SystemMonitor
-    
-    var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: [
-                    Color(red: 0.04, green: 0.05, blue: 0.16),
-                    Color(red: 0.10, green: 0.05, blue: 0.22),
-                    Color(red: 0.18, green: 0.12, blue: 0.28)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
-            
-            ScrollView {
-                VStack(spacing: 24) {
-                    HStack {
-                        Text(category)
-                            .font(.system(.largeTitle, design: .rounded, weight: .bold))
-                            .foregroundStyle(
-                                LinearGradient(
-                                    colors: [Color.white, Color.white.opacity(0.86)],
-                                    startPoint: .leading,
-                                    endPoint: .trailing
-                                )
-                            )
-                        
-                        Spacer()
-                        
-                        Text("\(systemMonitor.getTasksByCategory(category).filter { systemMonitor.selectedTasks.contains($0.id) }.count) selected")
-                            .font(.system(.headline, design: .rounded, weight: .medium))
-                            .foregroundColor(.secondary)
-                    }
-                    .padding(.horizontal, 24)
-                    .padding(.top, 24)
-                    
-                    GlassCardView {
-                        VStack(spacing: 12) {
-                            ForEach(systemMonitor.getTasksByCategory(category)) { task in
-                                OptimizationTaskRow(
-                                    task: task,
-                                    isSelected: systemMonitor.selectedTasks.contains(task.id)
-                                ) {
-                                    systemMonitor.toggleTask(task.id)
-                                }
-                                
-                                if task.id != systemMonitor.getTasksByCategory(category).last?.id {
-                                    Divider()
-                                        .padding(.horizontal, 20)
-                                }
-                            }
-                        }
-                    }
-                    .padding(.horizontal, 24)
-                    
-                    Spacer(minLength: 100)
-                }
-            }
-        }
-    }
-}
-
-// MARK: - Enhanced Dashboard View
+// MARK: - Dashboard View (single screen: select tasks and run in one place)
 struct DashboardView: View {
     @ObservedObject var systemMonitor: SystemMonitor
-    
+
     var body: some View {
         ZStack {
             LinearGradient(
@@ -1336,102 +1406,134 @@ struct DashboardView: View {
                 endPoint: .bottomTrailing
             )
             .ignoresSafeArea()
-            
-            ScrollView(showsIndicators: false) {
-                VStack(spacing: 32) {
-                    VStack(spacing: 16) {
-                        Text("OptiMac by VonKleistL")
-                            .font(.system(.largeTitle, design: .rounded, weight: .heavy))
-                            .foregroundStyle(
-                                LinearGradient(
-                                    colors: [
-                                        Color.white,
-                                        Color(red: 0.80, green: 0.92, blue: 1.00),
-                                        Color.white.opacity(0.92)
-                                    ],
-                                    startPoint: .leading,
-                                    endPoint: .trailing
-                                )
-                            )
-                        
-                        Text("M-Series Performance Suite • Real-Time System Monitor")
-                            .font(.system(.title2, design: .rounded, weight: .medium))
-                            .foregroundStyle(
-                                LinearGradient(
-                                    colors: [Color.white.opacity(0.88), Color.white.opacity(0.66)],
-                                    startPoint: .leading,
-                                    endPoint: .trailing
-                                )
-                            )
-                    }
-                    .padding(.top, 24)
-                    
-                    GlassCardView {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Quick Optimization")
-                                    .font(.system(.title2, design: .rounded, weight: .bold))
-                                    .foregroundStyle(
-                                        LinearGradient(
-                                            colors: [Color.white, Color.white.opacity(0.92)],
-                                            startPoint: .leading,
-                                            endPoint: .trailing
-                                        )
-                                    )
-                                
-                                Text("\(systemMonitor.selectedTasks.count) optimizations selected")
-                                    .font(.system(.subheadline, design: .rounded, weight: .medium))
-                                    .foregroundColor(.secondary)
-                            }
-                            
-                            Spacer()
-                            
-                            Button(action: {
-                                systemMonitor.runOptimization()
-                            }) {
-                                HStack(spacing: 10) {
-                                    if systemMonitor.isOptimizing {
-                                        ProgressView()
-                                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                                            .scaleEffect(0.9)
-                                    } else {
-                                        Image(systemName: "bolt.fill")
-                                            .font(.system(.subheadline, weight: .bold))
-                                    }
-                                    
-                                    Text(systemMonitor.isOptimizing ? "Optimizing..." : "Run Boost")
-                                        .font(.system(.headline, design: .rounded, weight: .bold))
-                                }
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 24)
-                                .padding(.vertical, 14)
-                                .background(
+
+            VStack(spacing: 0) {
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 32) {
+                        VStack(spacing: 16) {
+                            Text("OptiMac by VonKleistL")
+                                .font(.system(.largeTitle, design: .rounded, weight: .heavy))
+                                .foregroundStyle(
                                     LinearGradient(
-                                        colors: [Color(red: 0.20, green: 0.60, blue: 1.00), Color(red: 0.60, green: 0.40, blue: 1.00)],
+                                        colors: [
+                                            Color.white,
+                                            Color(red: 0.80, green: 0.92, blue: 1.00),
+                                            Color.white.opacity(0.92)
+                                        ],
                                         startPoint: .leading,
                                         endPoint: .trailing
                                     )
                                 )
-                                .clipShape(Capsule())
-                                .shadow(color: Color(red: 0.20, green: 0.60, blue: 1.00).opacity(0.35), radius: 10, y: 5)
+
+                            Text("M-Series Performance Suite • Real-Time System Monitor")
+                                .font(.system(.title2, design: .rounded, weight: .medium))
+                                .foregroundStyle(
+                                    LinearGradient(
+                                        colors: [Color.white.opacity(0.88), Color.white.opacity(0.66)],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                )
+                        }
+                        .padding(.top, 24)
+
+                        LazyVGrid(columns: [
+                            GridItem(.flexible(), spacing: 20),
+                            GridItem(.flexible(), spacing: 20)
+                        ], spacing: 20) {
+                            ForEach(systemMonitor.currentMetrics) { metric in
+                                MetricCardView(metric: metric, realSystemMonitor: systemMonitor.realSystemMonitor)
                             }
-                            .buttonStyle(.plain)
-                            .disabled(systemMonitor.isOptimizing || systemMonitor.selectedTasks.isEmpty)
                         }
-                    }
-                    
-                    LazyVGrid(columns: [
-                        GridItem(.flexible(), spacing: 20),
-                        GridItem(.flexible(), spacing: 20)
-                    ], spacing: 20) {
-                        ForEach(systemMonitor.currentMetrics) { metric in
-                            MetricCardView(metric: metric, realSystemMonitor: systemMonitor.realSystemMonitor)
+
+                        ForEach(systemMonitor.categories, id: \.self) { category in
+                            VStack(alignment: .leading, spacing: 12) {
+                                HStack {
+                                    Text(category)
+                                        .font(.system(.title2, design: .rounded, weight: .bold))
+                                        .foregroundStyle(
+                                            LinearGradient(
+                                                colors: [Color.white, Color.white.opacity(0.86)],
+                                                startPoint: .leading,
+                                                endPoint: .trailing
+                                            )
+                                        )
+
+                                    Spacer()
+
+                                    Text("\(selectedCount(in: category)) selected")
+                                        .font(.system(.headline, design: .rounded, weight: .medium))
+                                        .foregroundColor(.secondary)
+                                }
+
+                                GlassCardView {
+                                    VStack(spacing: 12) {
+                                        ForEach(systemMonitor.getTasksByCategory(category)) { task in
+                                            OptimizationTaskRow(
+                                                task: task,
+                                                isSelected: systemMonitor.selectedTasks.contains(task.id)
+                                            ) {
+                                                systemMonitor.toggleTask(task.id)
+                                            }
+
+                                            if task.id != systemMonitor.getTasksByCategory(category).last?.id {
+                                                Divider()
+                                                    .padding(.horizontal, 20)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
+
+                        Spacer(minLength: 40)
                     }
-                    
-                    Spacer(minLength: 50)
+                    .padding(.horizontal, 24)
+                }
+
+                GlassCardView {
+                    HStack {
+                        Text("\(systemMonitor.selectedTasks.count) optimizations selected")
+                            .font(.system(.subheadline, design: .rounded, weight: .medium))
+                            .foregroundColor(.secondary)
+
+                        Spacer()
+
+                        Button(action: {
+                            systemMonitor.runOptimization()
+                        }) {
+                            HStack(spacing: 10) {
+                                if systemMonitor.isOptimizing {
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                        .scaleEffect(0.9)
+                                } else {
+                                    Image(systemName: "bolt.fill")
+                                        .font(.system(.subheadline, weight: .bold))
+                                }
+
+                                Text(systemMonitor.isOptimizing ? "Optimizing..." : "Run Boost")
+                                    .font(.system(.headline, design: .rounded, weight: .bold))
+                            }
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 14)
+                            .background(
+                                LinearGradient(
+                                    colors: [Color(red: 0.20, green: 0.60, blue: 1.00), Color(red: 0.60, green: 0.40, blue: 1.00)],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .clipShape(Capsule())
+                            .shadow(color: Color(red: 0.20, green: 0.60, blue: 1.00).opacity(0.35), radius: 10, y: 5)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(systemMonitor.isOptimizing || systemMonitor.selectedTasks.isEmpty)
+                    }
                 }
                 .padding(.horizontal, 24)
+                .padding(.vertical, 12)
             }
         }
         // Confirmation sheet after optimizations complete
@@ -1447,19 +1549,38 @@ struct DashboardView: View {
                     Text("Finished at \(date.formatted(date: .abbreviated, time: .standard))")
                         .foregroundColor(.secondary)
                 }
-                if systemMonitor.lastRunTasks.isEmpty {
+                if systemMonitor.taskResults.isEmpty {
                     Text("No tasks were executed.")
                 } else {
-                    Text("Tasks run:")
+                    Text("Task results:")
                         .font(.headline)
                     ScrollView {
                         VStack(alignment: .leading, spacing: 8) {
-                            ForEach(systemMonitor.lastRunTasks) { task in
-                                HStack {
-                                    Image(systemName: "bolt.fill").foregroundColor(Color(red: 0.20, green: 0.60, blue: 1.00))
-                                    Text(task.title)
-                                    Spacer()
+                            ForEach(systemMonitor.taskResults) { result in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack {
+                                        Image(systemName: result.succeeded ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                            .foregroundColor(result.succeeded ? .green : Color(red: 1.00, green: 0.22, blue: 0.30))
+                                        Text(result.task.title)
+                                        Spacer()
+                                        if result.task.requiresAdmin {
+                                            Image(systemName: "lock.shield")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+                                    if !result.output.isEmpty {
+                                        Text(result.output)
+                                            .font(.system(.caption, design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                            .lineLimit(3)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
                                 }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
+                                .background(Color.black.opacity(0.25))
+                                .cornerRadius(8)
                             }
                         }
                     }
@@ -1475,57 +1596,27 @@ struct DashboardView: View {
             .frame(minWidth: 420)
         }
     }
+
+    private func selectedCount(in category: String) -> Int {
+        systemMonitor.getTasksByCategory(category)
+            .filter { systemMonitor.selectedTasks.contains($0.id) }
+            .count
+    }
 }
 
 // MARK: - Main Content View
 struct ContentView: View {
     // Injected shared SystemMonitor instead of owning our own
     @ObservedObject var systemMonitor: SystemMonitor
-    
+
     init(systemMonitor: SystemMonitor) {
         self.systemMonitor = systemMonitor
     }
-    
+
     var body: some View {
-        TabView {
-            DashboardView(systemMonitor: systemMonitor)
-                .tabItem {
-                    Image(systemName: "chart.bar.fill")
-                    Text("Dashboard")
-                }
-            
-            OptimizationCategoryView(category: "Memory & Performance", systemMonitor: systemMonitor)
-                .tabItem {
-                    Image(systemName: "memorychip.fill")
-                    Text("Memory")
-                }
-            
-            OptimizationCategoryView(category: "System Tweaks", systemMonitor: systemMonitor)
-                .tabItem {
-                    Image(systemName: "gearshape.2.fill")
-                    Text("System")
-                }
-            
-            OptimizationCategoryView(category: "Network", systemMonitor: systemMonitor)
-                .tabItem {
-                    Image(systemName: "wifi")
-                    Text("Network")
-                }
-            
-            OptimizationCategoryView(category: "Development", systemMonitor: systemMonitor)
-                .tabItem {
-                    Image(systemName: "hammer.fill")
-                    Text("Development")
-                }
-            
-            OptimizationCategoryView(category: "Advanced", systemMonitor: systemMonitor)
-                .tabItem {
-                    Image(systemName: "cpu.fill")
-                    Text("Advanced")
-                }
-        }
-        .preferredColorScheme(.dark)
-        .accentColor(Color(red: 0.20, green: 0.60, blue: 1.00))
+        DashboardView(systemMonitor: systemMonitor)
+            .preferredColorScheme(.dark)
+            .accentColor(Color(red: 0.20, green: 0.60, blue: 1.00))
     }
 }
 
